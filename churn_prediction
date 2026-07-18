@@ -1,0 +1,589 @@
+"""
+Churn Prediction with Business Case
+====================================
+Uses the real Kaggle Telco Customer Churn dataset.
+Goes beyond predicting who churns — determines which customers are worth saving
+and what intervention budget makes sense given their lifetime value.
+
+Skills demonstrated: CLV modeling, Classification, Business ROI framing, Segmentation
+
+HOW TO GET THE DATASET
+-----------------------
+Option A (automatic, no account needed):
+  The script tries to download it from a public mirror automatically.
+
+Option B (Kaggle CLI):
+  pip install kaggle
+  kaggle datasets download -d blastchar/telco-customer-churn
+  unzip telco-customer-churn.zip
+
+Option C (manual):
+  Download from https://www.kaggle.com/datasets/blastchar/telco-customer-churn
+  Place WA_Fn-UseC_-Telco-Customer-Churn.csv in the same folder as this script.
+"""
+
+import sys
+import os
+import numpy as np
+
+# All output files land next to the script, not the current working directory
+HERE = os.path.dirname(os.path.abspath(__file__))
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")          # headless – works everywhere; remove for interactive
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import (
+    classification_report, roc_auc_score,
+    roc_curve, confusion_matrix, ConfusionMatrixDisplay
+)
+from sklearn.cluster import KMeans
+import warnings
+warnings.filterwarnings("ignore")
+
+np.random.seed(42)
+
+# ── colour palette used across all charts ────────────────────────────────────
+PALETTE = {
+    "bg":      "#0f1117",
+    "panel":   "#1a1d27",
+    "accent1": "#4f8ef7",   # blue
+    "accent2": "#f7614f",   # red-orange
+    "accent3": "#50d8a0",   # green
+    "accent4": "#f7c44f",   # yellow
+    "text":    "#e0e4f0",
+    "subtext": "#7a7f99",
+    "grid":    "#2a2d3d",
+}
+SEG_COLORS = {
+    "High-Value at Risk": PALETTE["accent2"],
+    "High-Value Stable":  PALETTE["accent3"],
+    "Low-Value at Risk":  PALETTE["accent4"],
+    "Low-Value Stable":   PALETTE["subtext"],
+}
+
+def set_dark_style():
+    plt.rcParams.update({
+        "figure.facecolor":  PALETTE["bg"],
+        "axes.facecolor":    PALETTE["panel"],
+        "axes.edgecolor":    PALETTE["grid"],
+        "axes.labelcolor":   PALETTE["text"],
+        "xtick.color":       PALETTE["subtext"],
+        "ytick.color":       PALETTE["subtext"],
+        "text.color":        PALETTE["text"],
+        "grid.color":        PALETTE["grid"],
+        "grid.linestyle":    "--",
+        "grid.alpha":        0.6,
+        "font.family":       "DejaVu Sans",
+        "axes.spines.top":   False,
+        "axes.spines.right": False,
+    })
+
+set_dark_style()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. LOAD KAGGLE DATA  (auto-download → fallback to synthetic)
+# ─────────────────────────────────────────────────────────────────────────────
+
+KNOWN_PATHS = [
+    os.path.join(HERE, "WA_Fn-UseC_-Telco-Customer-Churn.csv"),
+    os.path.join(HERE, "telco-customer-churn.csv"),
+    os.path.join(HERE, "Telco-Customer-Churn.csv"),
+]
+MIRROR_URL = (
+    "https://raw.githubusercontent.com/"
+    "IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv"
+)
+
+
+def _download_csv(url, dest):
+    try:
+        import urllib.request, ssl
+        print(f"  Downloading from {url} ...")
+        # bypass Mac SSL cert verification (common issue with Python from python.org)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(url, context=ctx) as r, open(dest, "wb") as f:
+            f.write(r.read())
+        return True
+    except Exception as e:
+        print(f"  Download failed: {e}")
+        return False
+
+
+def load_kaggle_data():
+    """
+    Priority:
+    1. Kaggle CLI  (kaggle datasets download -d blastchar/telco-customer-churn)
+    2. Local file already present
+    3. Public GitHub mirror (IBM repo)
+    4. Synthetic fallback
+    """
+    # Try Kaggle CLI
+    try:
+        import kaggle
+        print("  Using Kaggle API …")
+        kaggle.api.authenticate()
+        kaggle.api.dataset_download_files(
+            "blastchar/telco-customer-churn", path=".", unzip=True
+        )
+    except Exception:
+        pass
+
+    # Try known local / newly-downloaded paths
+    for p in KNOWN_PATHS:
+        if os.path.exists(p):
+            print(f"  Found dataset at: {p}")
+            return pd.read_csv(p), "kaggle"
+
+    # Try public mirror
+    dest = os.path.join(HERE, "Telco-Customer-Churn.csv")
+    if _download_csv(MIRROR_URL, dest):
+        if os.path.exists(dest):
+            print(f"  Downloaded dataset to: {dest}")
+            return pd.read_csv(dest), "kaggle"
+
+    # Synthetic fallback
+    print("  ⚠  Could not obtain Kaggle dataset — using synthetic data instead.")
+    print("     To use real data, run:  pip install kaggle && kaggle datasets download")
+    print("     -d blastchar/telco-customer-churn\n")
+    return _generate_synthetic(2000), "synthetic"
+
+
+def _generate_synthetic(n=2000):
+    df = pd.DataFrame()
+    df["customerID"]      = [f"CUST_{i:04d}" for i in range(n)]
+    df["tenure"]          = np.random.randint(1, 72, n)
+    df["MonthlyCharges"]  = np.round(np.random.uniform(20, 120, n), 2)
+    df["TotalCharges"]    = np.round(df["tenure"] * df["MonthlyCharges"] * np.random.uniform(0.9, 1.1, n), 2)
+    df["Contract"]        = np.random.choice(["Month-to-month", "One year", "Two year"], p=[0.55, 0.25, 0.20], size=n)
+    df["InternetService"] = np.random.choice(["DSL", "Fiber optic", "No"], p=[0.35, 0.45, 0.20], size=n)
+    df["TechSupport"]     = np.random.choice(["Yes", "No", "No internet service"], size=n)
+    df["OnlineSecurity"]  = np.random.choice(["Yes", "No", "No internet service"], size=n)
+    df["PaymentMethod"]   = np.random.choice(["Electronic check", "Mailed check", "Bank transfer", "Credit card"], size=n)
+    df["SeniorCitizen"]   = np.random.choice([0, 1], p=[0.84, 0.16], size=n)
+    df["Partner"]         = np.random.choice(["Yes", "No"], size=n)
+    df["Dependents"]      = np.random.choice(["Yes", "No"], p=[0.30, 0.70], size=n)
+    df["PaperlessBilling"]= np.random.choice(["Yes", "No"], size=n)
+    logit = (
+        -1.5
+        - 0.03 * df["tenure"]
+        + 0.01 * df["MonthlyCharges"]
+        + 1.20 * (df["Contract"] == "Month-to-month").astype(int)
+        + 0.80 * (df["InternetService"] == "Fiber optic").astype(int)
+        - 0.50 * (df["TechSupport"] == "Yes").astype(int)
+        - 0.50 * (df["OnlineSecurity"] == "Yes").astype(int)
+    )
+    prob = 1 / (1 + np.exp(-logit))
+    df["Churn"] = np.where(np.random.rand(n) < prob, "Yes", "No")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. CLEAN & FEATURE-ENGINEER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def preprocess(raw):
+    df = raw.copy()
+
+    # TotalCharges sometimes has spaces
+    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    df["TotalCharges"].fillna(df["MonthlyCharges"], inplace=True)
+
+    df["churned"] = (df["Churn"] == "Yes").astype(int)
+
+    # Normalise contract labels
+    df["contract_type"] = df["Contract"].str.strip().replace({
+        "Month-to-month": "Month-to-Month",
+        "One year":       "One Year",
+        "Two year":       "Two Year",
+    })
+
+    # Derived features
+    df["tenure_months"]    = df["tenure"].astype(int)
+    df["monthly_charges"]  = df["MonthlyCharges"].astype(float)
+
+    def col_eq(col, val):
+        """Return int Series: 1 where df[col]==val, 0 if column is missing."""
+        if col in df.columns:
+            return (df[col] == val).astype(int)
+        return pd.Series(0, index=df.index)
+
+    df["num_services"] = (
+        col_eq("PhoneService",     "Yes") +
+        col_eq("MultipleLines",    "Yes") +
+        col_eq("OnlineSecurity",   "Yes") +
+        col_eq("OnlineBackup",     "Yes") +
+        col_eq("DeviceProtection", "Yes") +
+        col_eq("TechSupport",      "Yes") +
+        col_eq("StreamingTV",      "Yes") +
+        col_eq("StreamingMovies",  "Yes")
+    )
+    df["customer_id"] = df["customerID"] if "customerID" in df.columns else df.index.astype(str)
+
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. CLV
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_clv(df, discount_rate=0.10, margin_rate=0.30):
+    monthly_discount = discount_rate / 12
+    monthly_margin   = df["monthly_charges"] * margin_rate
+
+    contract_churn_rates = {
+        "Month-to-Month": 0.035,
+        "One Year":       0.010,
+        "Two Year":       0.005,
+    }
+    monthly_churn_rate = df["contract_type"].map(contract_churn_rates).fillna(0.02)
+
+    df["monthly_margin"] = monthly_margin
+    df["clv"] = np.round(monthly_margin / (monthly_discount + monthly_churn_rate), 2)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. CHURN MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+FEATURE_COLS = [
+    "tenure_months", "monthly_charges", "num_services",
+    "SeniorCitizen", "contract_type",
+]
+
+def _get_optional(df, col, fallback_val):
+    return df[col] if col in df.columns else pd.Series(fallback_val, index=df.index)
+
+def build_features(df):
+    X = pd.DataFrame()
+    X["tenure_months"]   = df["tenure_months"]
+    X["monthly_charges"] = df["monthly_charges"]
+    X["num_services"]    = df["num_services"]
+    X["senior"]          = df["SeniorCitizen"].astype(int)
+    X["fiber"]           = (_get_optional(df, "InternetService", "No") == "Fiber optic").astype(int)
+    X["no_security"]     = (_get_optional(df, "OnlineSecurity", "No") == "No").astype(int)
+    X["no_techsupport"]  = (_get_optional(df, "TechSupport",    "No") == "No").astype(int)
+    X["paperless"]       = (_get_optional(df, "PaperlessBilling","No") == "Yes").astype(int)
+    X["echeck"]          = (_get_optional(df, "PaymentMethod",  "Other") == "Electronic check").astype(int)
+    dummies = pd.get_dummies(df["contract_type"], prefix="contract", drop_first=False)
+    X = pd.concat([X, dummies], axis=1)
+    return X
+
+
+def build_churn_model(df):
+    X = build_features(df)
+    y = df["churned"]
+    feat_names = list(X.columns)
+
+    scaler   = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_scaled, y, test_size=0.20, random_state=42, stratify=y
+    )
+
+    model = RandomForestClassifier(
+        n_estimators=300, max_depth=10, min_samples_leaf=5,
+        class_weight="balanced", random_state=42, n_jobs=-1
+    )
+    model.fit(X_tr, y_tr)
+
+    df["churn_probability"] = np.round(model.predict_proba(X_scaled)[:, 1], 4)
+
+    y_pred  = model.predict(X_te)
+    y_proba = model.predict_proba(X_te)[:, 1]
+
+    print("\n" + "="*60)
+    print("  CHURN MODEL PERFORMANCE (Test Set)")
+    print("="*60)
+    print(classification_report(y_te, y_pred, target_names=["Stay", "Churn"]))
+    print(f"  ROC-AUC: {roc_auc_score(y_te, y_proba):.4f}")
+
+    importances = pd.Series(model.feature_importances_, index=feat_names).sort_values(ascending=False)
+    print("\n  Top 5 Features:")
+    for f, v in importances.head(5).items():
+        print(f"  {'█' * int(v*50)}  {f} ({v:.3f})")
+
+    return model, scaler, feat_names, df, (X_te, y_te, y_pred, y_proba)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. SEGMENTATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def segment_customers(df):
+    seg = df[["clv", "churn_probability"]].copy()
+    seg["clv_n"]   = (seg["clv"]   - seg["clv"].mean())   / seg["clv"].std()
+    seg["churn_n"] = (seg["churn_probability"] - seg["churn_probability"].mean()) / seg["churn_probability"].std()
+
+    km = KMeans(n_clusters=4, random_state=42, n_init=10)
+    df["segment_id"] = km.fit_predict(seg[["clv_n", "churn_n"]])
+
+    summary = df.groupby("segment_id").agg(
+        mean_clv=("clv", "mean"), mean_churn=("churn_probability", "mean"),
+        count=("customer_id", "count")
+    ).reset_index()
+    summary["clv_rank"]   = summary["mean_clv"].rank()
+    summary["churn_rank"] = summary["mean_churn"].rank()
+
+    def label(row):
+        hv = row["clv_rank"]   > 2
+        hc = row["churn_rank"] > 2
+        if hv and hc:  return "High-Value at Risk"
+        if hv:         return "High-Value Stable"
+        if hc:         return "Low-Value at Risk"
+        return "Low-Value Stable"
+
+    summary["label"] = summary.apply(label, axis=1)
+    df["segment"] = df["segment_id"].map(dict(zip(summary["segment_id"], summary["label"])))
+    return df, summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. ROI ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def business_roi_analysis(df, intervention_cost=50.0, save_rate=0.30):
+    df["expected_savings"] = np.round(df["churn_probability"] * save_rate * df["clv"], 2)
+    df["net_roi"]          = np.round(df["expected_savings"] - intervention_cost, 2)
+    df["worth_saving"]     = df["net_roi"] > 0
+
+    actionable = df[df["worth_saving"]]
+    predicted  = df[df["churn_probability"] >= 0.5]
+    spend      = len(actionable) * intervention_cost
+    saved      = actionable["expected_savings"].sum()
+    roi        = (saved - spend) / spend * 100 if spend else 0
+
+    print("\n" + "="*60)
+    print("  BUSINESS ROI ANALYSIS")
+    print("="*60)
+    print(f"  Intervention cost / customer   : ${intervention_cost:.2f}")
+    print(f"  Assumed save rate              : {save_rate*100:.0f}%")
+    print(f"  Total customers                : {len(df):,}")
+    print(f"  Predicted churners (≥50%)      : {len(predicted):,}")
+    print(f"  Worth saving (positive ROI)    : {len(actionable):,}")
+    print(f"  Intervention spend             : ${spend:,.0f}")
+    print(f"  Expected revenue saved         : ${saved:,.0f}")
+    print(f"  Net campaign ROI               : {roi:.1f}%")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. CHARTS  (8 total, saved to churn_dashboard.png)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_charts(df, model, feat_names, eval_data, source):
+    X_te, y_te, y_pred, y_proba = eval_data
+
+    fig = plt.figure(figsize=(22, 28), facecolor=PALETTE["bg"])
+    fig.suptitle(
+        f"Churn Prediction — Business Case Dashboard  "
+        f"({'Kaggle Telco' if source == 'kaggle' else 'Synthetic'} Data  |  n={len(df):,})",
+        fontsize=18, fontweight="bold", color=PALETTE["text"], y=0.98
+    )
+    gs = GridSpec(4, 3, figure=fig, hspace=0.52, wspace=0.38,
+                  top=0.95, bottom=0.04, left=0.07, right=0.97)
+
+    # ── helper ────────────────────────────────────────────────────────────────
+    def ax_title(ax, t):
+        ax.set_title(t, fontsize=11, fontweight="bold",
+                     color=PALETTE["text"], pad=10)
+
+    # ── 1. Churn Rate by Contract Type ───────────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    ct = df.groupby("contract_type")["churned"].mean().sort_values(ascending=False)
+    bars = ax1.bar(ct.index, ct.values * 100,
+                   color=[PALETTE["accent2"], PALETTE["accent4"], PALETTE["accent3"]],
+                   edgecolor="none", width=0.55)
+    ax1.set_ylabel("Churn Rate (%)", color=PALETTE["text"])
+    ax1.set_ylim(0, ct.max() * 130)
+    ax1.yaxis.grid(True); ax1.set_axisbelow(True)
+    for b in bars:
+        ax1.text(b.get_x() + b.get_width()/2, b.get_height() + 0.5,
+                 f"{b.get_height():.1f}%", ha="center", va="bottom",
+                 fontsize=9, color=PALETTE["text"])
+    ax_title(ax1, "Churn Rate by Contract Type")
+
+    # ── 2. Monthly Charges Distribution by Churn ─────────────────────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    for val, col, lbl in [(0, PALETTE["accent3"], "Stay"),
+                           (1, PALETTE["accent2"], "Churn")]:
+        d = df[df["churned"] == val]["monthly_charges"]
+        ax2.hist(d, bins=35, alpha=0.65, color=col, label=lbl, edgecolor="none")
+    ax2.set_xlabel("Monthly Charges ($)")
+    ax2.set_ylabel("Count")
+    ax2.legend(facecolor=PALETTE["panel"], labelcolor=PALETTE["text"])
+    ax2.yaxis.grid(True); ax2.set_axisbelow(True)
+    ax_title(ax2, "Monthly Charges: Stay vs Churn")
+
+    # ── 3. Tenure Distribution ────────────────────────────────────────────────
+    ax3 = fig.add_subplot(gs[0, 2])
+    for val, col, lbl in [(0, PALETTE["accent3"], "Stay"),
+                           (1, PALETTE["accent2"], "Churn")]:
+        d = df[df["churned"] == val]["tenure_months"]
+        ax3.hist(d, bins=30, alpha=0.65, color=col, label=lbl, edgecolor="none")
+    ax3.set_xlabel("Tenure (months)")
+    ax3.set_ylabel("Count")
+    ax3.legend(facecolor=PALETTE["panel"], labelcolor=PALETTE["text"])
+    ax3.yaxis.grid(True); ax3.set_axisbelow(True)
+    ax_title(ax3, "Tenure: Stay vs Churn")
+
+    # ── 4. Feature Importances ────────────────────────────────────────────────
+    ax4 = fig.add_subplot(gs[1, 0])
+    imp = pd.Series(model.feature_importances_, index=feat_names).sort_values()
+    top = imp.tail(8)
+    colors = [PALETTE["accent1"]] * len(top)
+    colors[-1] = PALETTE["accent2"]
+    ax4.barh(top.index, top.values, color=colors, edgecolor="none", height=0.6)
+    ax4.set_xlabel("Importance")
+    ax4.xaxis.grid(True); ax4.set_axisbelow(True)
+    ax_title(ax4, "Top Feature Importances")
+
+    # ── 5. ROC Curve ──────────────────────────────────────────────────────────
+    ax5 = fig.add_subplot(gs[1, 1])
+    fpr, tpr, _ = roc_curve(y_te, y_proba)
+    auc = roc_auc_score(y_te, y_proba)
+    ax5.plot(fpr, tpr, color=PALETTE["accent1"], lw=2, label=f"AUC = {auc:.3f}")
+    ax5.plot([0, 1], [0, 1], "--", color=PALETTE["subtext"], lw=1)
+    ax5.fill_between(fpr, tpr, alpha=0.10, color=PALETTE["accent1"])
+    ax5.set_xlabel("False Positive Rate"); ax5.set_ylabel("True Positive Rate")
+    ax5.legend(facecolor=PALETTE["panel"], labelcolor=PALETTE["text"])
+    ax5.yaxis.grid(True); ax5.set_axisbelow(True)
+    ax_title(ax5, "ROC Curve (Test Set)")
+
+    # ── 6. Confusion Matrix ───────────────────────────────────────────────────
+    ax6 = fig.add_subplot(gs[1, 2])
+    cm = confusion_matrix(y_te, y_pred)
+    im = ax6.imshow(cm, cmap="Blues", aspect="auto")
+    ax6.set_xticks([0, 1]); ax6.set_yticks([0, 1])
+    ax6.set_xticklabels(["Stay", "Churn"]); ax6.set_yticklabels(["Stay", "Churn"])
+    ax6.set_xlabel("Predicted"); ax6.set_ylabel("Actual")
+    for i in range(2):
+        for j in range(2):
+            ax6.text(j, i, str(cm[i, j]), ha="center", va="center",
+                     fontsize=18, fontweight="bold",
+                     color="white" if cm[i, j] > cm.max()/2 else PALETTE["text"])
+    ax_title(ax6, "Confusion Matrix")
+
+    # ── 7. CLV vs Churn Probability Scatter (segments) ───────────────────────
+    ax7 = fig.add_subplot(gs[2, :2])
+    for seg, grp in df.groupby("segment"):
+        color = SEG_COLORS.get(seg, PALETTE["subtext"])
+        ax7.scatter(grp["churn_probability"], grp["clv"],
+                    c=color, alpha=0.45, s=18, label=seg, edgecolors="none")
+    ax7.set_xlabel("Churn Probability")
+    ax7.set_ylabel("Customer Lifetime Value ($)")
+    ax7.yaxis.grid(True); ax7.set_axisbelow(True)
+    leg = ax7.legend(facecolor=PALETTE["panel"], labelcolor=PALETTE["text"],
+                     markerscale=2, loc="upper right")
+    ax_title(ax7, "CLV vs Churn Probability  (by Segment)")
+
+    # ── 8. ROI Waterfall by Segment ───────────────────────────────────────────
+    ax8 = fig.add_subplot(gs[2, 2])
+    seg_roi = df.groupby("segment")["net_roi"].sum().sort_values()
+    colors  = [PALETTE["accent2"] if v < 0 else PALETTE["accent3"] for v in seg_roi]
+    # Shorten labels
+    short = [s.replace("High-Value", "HV").replace("Low-Value", "LV") for s in seg_roi.index]
+    bars  = ax8.barh(short, seg_roi.values / 1000, color=colors, edgecolor="none", height=0.6)
+    ax8.set_xlabel("Net ROI ($000s)")
+    ax8.xaxis.grid(True); ax8.set_axisbelow(True)
+    ax8.axvline(0, color=PALETTE["text"], lw=0.8)
+    ax_title(ax8, "Total Net ROI by Segment")
+
+    # ── 9. (bonus) Churn Probability Distribution ─────────────────────────────
+    ax9 = fig.add_subplot(gs[3, 0])
+    ax9.hist(df["churn_probability"], bins=40, color=PALETTE["accent1"],
+             edgecolor="none", alpha=0.8)
+    ax9.axvline(0.5, color=PALETTE["accent2"], lw=1.5, linestyle="--", label="Decision = 0.5")
+    ax9.set_xlabel("Predicted Churn Probability")
+    ax9.set_ylabel("Count")
+    ax9.legend(facecolor=PALETTE["panel"], labelcolor=PALETTE["text"])
+    ax9.yaxis.grid(True); ax9.set_axisbelow(True)
+    ax_title(ax9, "Predicted Churn Probability Distribution")
+
+    # ── 10. Intervention Value vs Cost scatter ────────────────────────────────
+    ax10 = fig.add_subplot(gs[3, 1:])
+    worth     = df[df["worth_saving"]]
+    not_worth = df[~df["worth_saving"] & (df["churn_probability"] > 0.1)]
+    ax10.scatter(not_worth["clv"], not_worth["expected_savings"],
+                 c=PALETTE["subtext"], alpha=0.25, s=14, label="Not worth saving")
+    ax10.scatter(worth["clv"], worth["expected_savings"],
+                 c=PALETTE["accent3"], alpha=0.60, s=22, label="Worth saving")
+    # Intervention cost line
+    xlim = df["clv"].quantile(0.99)
+    ax10.axhline(50, color=PALETTE["accent2"], lw=1.5, linestyle="--",
+                 label="Intervention cost ($50)")
+    ax10.set_xlim(0, xlim)
+    ax10.set_xlabel("Customer Lifetime Value ($)")
+    ax10.set_ylabel("Expected Savings ($)")
+    ax10.legend(facecolor=PALETTE["panel"], labelcolor=PALETTE["text"])
+    ax10.yaxis.grid(True); ax10.set_axisbelow(True)
+    ax_title(ax10, "Expected Savings vs CLV  (Intervention Decision)")
+
+    out = os.path.join(HERE, "churn_dashboard.png")
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=PALETTE["bg"])
+    plt.close(fig)
+    print(f"\n  Charts saved → {out}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    print("\n" + "="*60)
+    print("  CHURN PREDICTION WITH BUSINESS CASE")
+    print("="*60)
+
+    print("\n[1/7] Loading data …")
+    raw, source = load_kaggle_data()
+    print(f"  Rows: {len(raw):,}  |  Columns: {len(raw.columns)}")
+
+    print("[2/7] Preprocessing …")
+    df = preprocess(raw)
+
+    print("[3/7] Calculating CLV …")
+    df = calculate_clv(df)
+
+    print("[4/7] Training churn model …")
+    model, scaler, feat_names, df, eval_data = build_churn_model(df)
+
+    print("\n[5/7] Segmenting customers …")
+    df, seg_summary = segment_customers(df)
+
+    print("[6/7] Running business ROI analysis …")
+    df = business_roi_analysis(df, intervention_cost=50.0, save_rate=0.30)
+
+    print("[7/7] Generating charts …")
+    chart_path = make_charts(df, model, feat_names, eval_data, source)
+
+    # Top targets
+    targets = (
+        df[df["worth_saving"]]
+        .sort_values("net_roi", ascending=False)
+        .head(10)[["customer_id", "segment", "monthly_charges",
+                    "clv", "churn_probability", "net_roi"]]
+    )
+    print("\n" + "="*60)
+    print("  TOP 10 CUSTOMERS TO TARGET")
+    print("="*60)
+    print(targets.to_string(index=False))
+
+    results_path = os.path.join(HERE, "churn_results.csv")
+    df.to_csv(results_path, index=False)
+    print(f"\n  Results saved → {results_path}")
+    print(f"  Dashboard  saved → {chart_path}")
+    print("\n" + "="*60 + "\n")
+
+
+if __name__ == "__main__":
+    main()
